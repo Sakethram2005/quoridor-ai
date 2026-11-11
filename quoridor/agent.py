@@ -2,21 +2,26 @@
 
 MinimaxAgent
 ------------
-* Minimax with alpha-beta pruning and iterative deepening (time limited).
-* Evaluation (from the point of view of the searching player `me`):
+Minimax with alpha-beta pruning and iterative deepening (time limited).
+Two configurations share the same search code so they can be compared:
 
-      score = W_PATH * (opp_shortest_path - my_shortest_path)
-            + W_WALL * (my_walls_left - opp_walls_left)
+  improved=False  ("basic", the original agent)
+      score = 10 * (opp_path - my_path) + 1.5 * (my_walls - opp_walls)
+      walls: every wall crossing the opponent's A* path that lengthens it.
 
-  where the shortest paths are computed with A* (see pathfinding.py).
-  A won position scores +WIN_SCORE (plus the remaining depth, so faster wins
-  are preferred); a lost position scores the negative.
-* Branching-factor control: a Quoridor position has up to ~130 legal moves, so
-  only *useful* walls are generated: walls that block an edge of the opponent's
-  current A* path AND really lengthen it.  Pawn moves are always generated.
-* Move ordering (static evaluation of children) makes alpha-beta cut much more.
+  improved=True   (default)
+      * evaluation = path difference + tempo (side to move is half a step
+        ahead) + wall difference + "flexibility" (number of optimal first
+        steps; a pawn in a one-wide corridor is easy to block) + an exact
+        race rule (a player with no walls left cannot be stopped, so the
+        side that arrives first has won).
+      * transposition table (kept between moves) with exact/lower/upper bound
+        flags, and the stored best move is searched first.
+      * walls are ranked by net gain (opponent lengthened minus self
+        lengthened) and only the best `max_walls` are searched.
+      * ties at the root are broken randomly, so games are not all identical.
 
-GreedyAgent / RandomAgent are weak baselines used for the demo and tournament.
+MCTS lives in mcts.py.  GreedyAgent / RandomAgent are weak baselines.
 """
 from __future__ import annotations
 
@@ -27,11 +32,16 @@ from typing import List, Optional, Tuple
 from .game import State
 
 WIN_SCORE = 10_000
+RACE_SCORE = 2_000
 W_PATH = 10.0
-W_WALL = 1.5
+W_WALL = 1.5            # original weight (basic agent)
+IMPROVED_WEIGHTS = {"wall": 2.5, "tempo": 4.0, "flex": 0.5, "race": 1.0}
 
 # level -> (max search depth, time limit in seconds per move)
 LEVELS = {1: (1, 0.5), 2: (2, 1.5), 3: (3, 3.0), 4: (4, 6.0)}
+
+_EXACT, _LOWER, _UPPER = 0, 1, 2
+_TT_LIMIT = 400_000
 
 
 class SearchTimeout(Exception):
@@ -48,13 +58,16 @@ class Agent:
 class RandomAgent(Agent):
     name = "Random"
 
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = random.Random(seed)
+
     def choose_move(self, state: State):
         pawn = [("move", r, c) for r, c in state.pawn_moves()]
-        if state.walls_left[state.turn] > 0 and random.random() < 0.3:
+        if state.walls_left[state.turn] > 0 and self.rng.random() < 0.3:
             walls = state.legal_walls()
             if walls:
-                return random.choice(walls)
-        return random.choice(pawn)
+                return self.rng.choice(walls)
+        return self.rng.choice(pawn)
 
 
 class GreedyAgent(Agent):
@@ -73,46 +86,90 @@ class GreedyAgent(Agent):
         return best
 
 
+# ---------------------------------------------------------------- wall logic
+def candidate_walls(state: State, target: int):
+    """Geometrically valid walls that cross an edge of `target`'s shortest path.
+
+    A wall that does not cross the current shortest path cannot lengthen it,
+    so this set contains every wall that can possibly hurt `target`.
+    """
+    path = state.shortest_path(target)
+    seen, out = set(), []
+    for a, b in zip(path, path[1:]):
+        if a[0] != b[0]:                       # vertical step -> horizontal walls
+            r, c = min(a[0], b[0]), a[1]
+            options = ((r, c - 1, "H"), (r, c, "H"))
+        else:                                  # horizontal step -> vertical walls
+            r, c = a[0], min(a[1], b[1])
+            options = ((r - 1, c, "V"), (r, c, "V"))
+        for w in options:
+            if w not in seen and state.wall_fits(*w):
+                seen.add(w)
+                out.append(w)
+    return out
+
+
+# ---------------------------------------------------------------- evaluation
+def basic_evaluate(state: State, me: int) -> float:
+    w = state.winner()
+    if w is not None:
+        return WIN_SCORE if w == me else -WIN_SCORE
+    opp = 1 - me
+    return (W_PATH * (state.dist(opp) - state.dist(me))
+            + W_WALL * (state.walls_left[me] - state.walls_left[opp]))
+
+
+def improved_evaluate(state: State, me: int, weights=IMPROVED_WEIGHTS) -> float:
+    w = state.winner()
+    if w is not None:
+        return WIN_SCORE if w == me else -WIN_SCORE
+    opp = 1 - me
+    d_me, d_opp = state.dist(me), state.dist(opp)
+    wl_me, wl_opp = state.walls_left[me], state.walls_left[opp]
+    me_to_move = state.turn == me
+    path_term = W_PATH * (d_opp - d_me)
+
+    # Race rule: a player without walls cannot slow the other one down, so if
+    # the other player is also ahead in the race, the game is decided.
+    if weights["race"] and (wl_opp == 0 or wl_me == 0):
+        me_first = d_me <= d_opp if me_to_move else d_me < d_opp
+        if wl_opp == 0 and me_first:
+            return RACE_SCORE + path_term
+        if wl_me == 0 and not me_first:
+            return -RACE_SCORE + path_term
+
+    return (path_term
+            + (weights["tempo"] if me_to_move else -weights["tempo"])
+            + weights["wall"] * (wl_me - wl_opp)
+            + weights["flex"] * (state.options(me) - state.options(opp)))
+
+
 class MinimaxAgent(Agent):
-    def __init__(self, max_depth: int = 3, time_limit: float = 3.0, useful_only: bool = True):
+    def __init__(self, max_depth: int = 3, time_limit: float = 3.0, useful_only: bool = True,
+                 improved: bool = True, max_walls: int = 10, seed: Optional[int] = None,
+                 weights: Optional[dict] = None, use_tt: bool = True):
         self.max_depth = max_depth
         self.time_limit = time_limit
         self.useful_only = useful_only
-        self.name = f"Minimax(d={max_depth})"
+        self.improved = improved
+        self.use_tt = improved and use_tt
+        self.max_walls = max_walls
+        self.weights = dict(IMPROVED_WEIGHTS, **(weights or {}))
+        self.rng = random.Random(seed)
+        self.name = f"Minimax(d={max_depth}{'' if improved else ',basic'})"
         self.last_stats = {}
         self._deadline = 0.0
         self._nodes = 0
+        self._tt: dict = {}
 
     # ------------------------------------------------------------ evaluation
-    @staticmethod
-    def evaluate(state: State, me: int) -> float:
-        w = state.winner()
-        if w is not None:
-            return WIN_SCORE if w == me else -WIN_SCORE
-        opp = 1 - me
-        return (W_PATH * (state.dist(opp) - state.dist(me))
-                + W_WALL * (state.walls_left[me] - state.walls_left[opp]))
+    def evaluate(self, state: State, me: int) -> float:
+        if self.improved:
+            return improved_evaluate(state, me, self.weights)
+        return basic_evaluate(state, me)
 
     # ------------------------------------------------------- move generation
-    @staticmethod
-    def _candidate_walls(state: State, target: int):
-        """Walls that cross an edge of `target`'s shortest path."""
-        path = state.shortest_path(target)
-        seen, out = set(), []
-        for a, b in zip(path, path[1:]):
-            if a[0] != b[0]:                       # vertical step -> horizontal walls
-                r, c = min(a[0], b[0]), a[1]
-                options = ((r, c - 1, "H"), (r, c, "H"))
-            else:                                  # horizontal step -> vertical walls
-                r, c = a[0], min(a[1], b[1])
-                options = ((r - 1, c, "V"), (r, c, "V"))
-            for w in options:
-                if w not in seen and state.wall_fits(*w):
-                    seen.add(w)
-                    out.append(w)
-        return out
-
-    def _children(self, state: State, me: int, order: bool) -> List[Tuple[tuple, State]]:
+    def _children(self, state: State, me: int, order: bool, first=None) -> List[Tuple[tuple, State]]:
         p = state.turn
         kids = []
         for r, c in state.pawn_moves(p):
@@ -120,16 +177,28 @@ class MinimaxAgent(Agent):
             kids.append((mv, state.apply(mv, check=False)))
         if state.walls_left[p] > 0:
             opp = 1 - p
-            base = state.dist(opp)
-            for r, c, o in self._candidate_walls(state, opp):
+            base_opp, base_me = state.dist(opp), state.dist(p)
+            walls = []
+            for r, c, o in candidate_walls(state, opp):
                 child = state.try_wall(r, c, o)
                 if child is None:
                     continue
-                if self.useful_only and child.dist(opp) <= base:
+                gain = child.dist(opp) - base_opp
+                if self.useful_only and gain <= 0:
                     continue
-                kids.append((("wall", r, c, o), child))
+                net = gain - (child.dist(p) - base_me) if self.improved else 0
+                walls.append((net, ("wall", r, c, o), child))
+            if self.improved:                       # best walls first, cap the rest
+                walls.sort(key=lambda x: -x[0])
+                walls = walls[:self.max_walls]
+            kids.extend((mv, ch) for _, mv, ch in walls)
         if order:
             kids.sort(key=lambda mc: self.evaluate(mc[1], me), reverse=(p == me))
+        if first is not None:                        # transposition-table move first
+            for i, (mv, _) in enumerate(kids):
+                if mv == first:
+                    kids.insert(0, kids.pop(i))
+                    break
         return kids
 
     # ---------------------------------------------------------------- search
@@ -143,21 +212,49 @@ class MinimaxAgent(Agent):
         if depth == 0:
             return self.evaluate(state, me)
 
-        kids = self._children(state, me, order=depth > 1)
+        key, tt_move = None, None
+        if self.use_tt:
+            key = (state.pawns, state.walls_left, state.walls, state.turn, me)
+            entry = self._tt.get(key)
+            if entry is not None:
+                e_depth, flag, val, tt_move = entry
+                if e_depth >= depth:
+                    if flag == _EXACT:
+                        return val
+                    if flag == _LOWER:
+                        alpha = max(alpha, val)
+                    else:
+                        beta = min(beta, val)
+                    if alpha >= beta:
+                        return val
+
+        a0, b0 = alpha, beta
+        kids = self._children(state, me, order=depth > 1, first=tt_move)
+        best_mv = None
         if state.turn == me:                       # MAX node
             best = float("-inf")
-            for _, child in kids:
-                best = max(best, self._minimax(child, depth - 1, alpha, beta, me))
+            for mv, child in kids:
+                v = self._minimax(child, depth - 1, alpha, beta, me)
+                if v > best:
+                    best, best_mv = v, mv
                 alpha = max(alpha, best)
                 if alpha >= beta:
                     break
-            return best
-        best = float("inf")                        # MIN node
-        for _, child in kids:
-            best = min(best, self._minimax(child, depth - 1, alpha, beta, me))
-            beta = min(beta, best)
-            if alpha >= beta:
-                break
+        else:                                      # MIN node
+            best = float("inf")
+            for mv, child in kids:
+                v = self._minimax(child, depth - 1, alpha, beta, me)
+                if v < best:
+                    best, best_mv = v, mv
+                beta = min(beta, best)
+                if alpha >= beta:
+                    break
+
+        if key is not None:
+            if len(self._tt) > _TT_LIMIT:
+                self._tt.clear()
+            flag = _UPPER if best <= a0 else _LOWER if best >= b0 else _EXACT
+            self._tt[key] = (depth, flag, best, best_mv)
         return best
 
     def choose_move(self, state: State):
@@ -170,17 +267,24 @@ class MinimaxAgent(Agent):
 
         for depth in range(1, self.max_depth + 1):
             scored = []
-            alpha = float("-inf")
+            top = float("-inf")
             try:
                 for mv, child in kids:
+                    # improved: search just below the best value so equal moves are exact
+                    alpha = top - 1e-6 if self.improved else top
                     val = self._minimax(child, depth - 1, alpha, float("inf"), me)
                     scored.append((val, mv, child))
-                    alpha = max(alpha, val)
+                    top = max(top, val)
             except SearchTimeout:
                 break
             scored.sort(key=lambda x: -x[0])       # stable: best first for next depth
             kids = [(mv, ch) for _, mv, ch in scored]
-            best_val, best_move, reached = scored[0][0], scored[0][1], depth
+            best_val, reached = scored[0][0], depth
+            if self.improved:
+                ties = [mv for v, mv, _ in scored if v == best_val]
+                best_move = self.rng.choice(ties)
+            else:
+                best_move = scored[0][1]
             if abs(best_val) >= WIN_SCORE:         # forced win/loss found
                 break
 

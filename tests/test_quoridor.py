@@ -3,7 +3,9 @@ import unittest
 
 from quoridor.game import State, GOAL_ROW, N
 from quoridor.pathfinding import astar, bfs_distance
-from quoridor.agent import MinimaxAgent, GreedyAgent
+from quoridor.agent import (MinimaxAgent, GreedyAgent, RACE_SCORE, WIN_SCORE,
+                            improved_evaluate, candidate_walls)
+from quoridor.mcts import MCTSAgent
 
 
 class RulesTests(unittest.TestCase):
@@ -78,6 +80,106 @@ class PathTests(unittest.TestCase):
                 self.assertEqual(len(path) - 1, bfs_distance(s, s.pawns[p], GOAL_ROW[p]))
                 for a, b in zip(path, path[1:]):
                     self.assertIn(b, list(s.neighbors(a)))
+
+
+def random_board(seed, n_walls=14):
+    rng = random.Random(seed)
+    s = State()
+    for _ in range(n_walls):
+        nxt = s.try_wall(rng.randrange(8), rng.randrange(8), rng.choice("HV"), player=rng.randrange(2))
+        if nxt is not None:
+            s = nxt
+    return s
+
+
+class DistanceFieldTests(unittest.TestCase):
+    def test_field_matches_astar(self):
+        for seed in range(25):
+            s = random_board(seed)
+            for p in (0, 1):
+                field = s.dist_field(p)
+                self.assertEqual(field[s.pawns[p]], s.dist(p))
+
+    def test_options_counts_optimal_first_steps(self):
+        s = State()
+        self.assertEqual(s.options(0), 1)                       # straight ahead only
+        s = State(pawns=((4, 4), (0, 4)))
+        self.assertEqual(s.options(0), 1)
+        s = State(pawns=((4, 4), (0, 4)), walls={(3, 4, "H")})  # wall ahead: detour
+        self.assertEqual(s.dist(0), 5)                          # wall spans cols 4-5: go left
+        self.assertEqual(s.options(0), 1)
+
+
+class EvaluationTests(unittest.TestCase):
+    def test_race_rule(self):
+        # opponent has no walls and I am clearly ahead -> decided
+        s = State(pawns=((3, 4), (2, 4)), walls_left=(5, 0), turn=0)
+        self.assertGreaterEqual(improved_evaluate(s, 0), RACE_SCORE)
+        # I have no walls and the opponent is ahead -> lost
+        s = State(pawns=((8, 4), (7, 4)), walls_left=(0, 5), turn=0)
+        self.assertLessEqual(improved_evaluate(s, 0), -RACE_SCORE + 100)
+
+    def test_terminal_scores(self):
+        s = State(pawns=((0, 3), (5, 5)))
+        self.assertEqual(improved_evaluate(s, 0), WIN_SCORE)
+        self.assertEqual(improved_evaluate(s, 1), -WIN_SCORE)
+
+    def test_candidate_walls_all_fit(self):
+        s = random_board(3, 8)
+        for w in candidate_walls(s, 1):
+            self.assertTrue(s.wall_fits(*w))
+
+
+class MinimaxVariantTests(unittest.TestCase):
+    def test_transposition_table_does_not_change_value(self):
+        for seed in range(4):
+            s = random_board(seed, 10)
+            vals = []
+            for tt in (True, False):
+                a = MinimaxAgent(3, 30, use_tt=tt, weights={"flex": 0.0})
+                a.choose_move(s)
+                vals.append(a.last_stats["score"])
+            self.assertAlmostEqual(vals[0], vals[1], places=6, msg=f"seed {seed}")
+
+    def test_basic_mode_still_plays_legally(self):
+        s = State()
+        agents = [MinimaxAgent(2, 1, improved=False), MinimaxAgent(2, 1, improved=True, seed=1)]
+        for _ in range(30):
+            if s.winner() is not None:
+                break
+            mv = agents[s.turn].choose_move(s)
+            self.assertTrue(s.is_legal(mv), mv)
+            s = s.apply(mv)
+
+
+class MCTSTests(unittest.TestCase):
+    def test_takes_immediate_win(self):
+        s = State(pawns=((1, 4), (6, 0)), turn=0)
+        self.assertEqual(MCTSAgent(50, seed=1).choose_move(s), ("move", 0, 4))
+
+    def test_blocks_opponent_about_to_win(self):
+        s = State(pawns=((8, 4), (7, 4)), turn=0)
+        self.assertEqual(MCTSAgent(300, seed=1).choose_move(s)[0], "wall")
+
+    def test_moves_are_always_legal(self):
+        s = State()
+        agents = [MCTSAgent(60, seed=2), GreedyAgent()]
+        for _ in range(40):
+            if s.winner() is not None:
+                break
+            mv = agents[s.turn].choose_move(s)
+            self.assertTrue(s.is_legal(mv), mv)
+            s = s.apply(mv)
+
+    def test_mcts_beats_greedy(self):
+        for mc_player in (0, 1):
+            agents = {mc_player: MCTSAgent(300, seed=3), 1 - mc_player: GreedyAgent()}
+            s = State()
+            for _ in range(200):
+                if s.winner() is not None:
+                    break
+                s = s.apply(agents[s.turn].choose_move(s))
+            self.assertEqual(s.winner(), mc_player)
 
 
 class AgentTests(unittest.TestCase):

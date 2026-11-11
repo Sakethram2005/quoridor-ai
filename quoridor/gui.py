@@ -22,6 +22,7 @@ import pygame
 
 from .agent import GreedyAgent, LEVELS, MinimaxAgent
 from .game import GOAL_ROW, N, State, cell_name, describe_move
+from .mcts import MCTSAgent
 
 # ---------------------------------------------------------------- layout
 CELL, GAP = 60, 14
@@ -46,7 +47,9 @@ GOOD = (96, 212, 132)
 BAD = (236, 84, 84)
 BTN, BTN_HOVER = (52, 58, 78), (72, 80, 108)
 
-MODES = ["Human vs AI", "AI vs Greedy (demo)", "AI vs AI", "Human vs Human"]
+MODES = ["Human vs AI", "AI vs Greedy (demo)", "AI vs AI", "Human vs Human",
+         "Human vs MCTS", "Minimax vs MCTS"]
+MCTS_ITERS = {1: 150, 2: 400, 3: 1000, 4: 2500}      # AI level -> MCTS iterations per move
 PLAYER_NAMES = ("Blue (bottom)", "Red (top)")
 
 
@@ -114,7 +117,7 @@ class App:
             Button((PANEL_X + 144, by, 134, 38), lambda: "A* path (P)", self.toggle_path),
             Button((PANEL_X, by + 48, 278, 38), lambda: f"Mode (M): {MODES[self.mode_idx]}", self.next_mode),
             Button((PANEL_X, by + 96, 278, 38), lambda: f"AI level (L): {self.level}  "
-                   f"[depth {LEVELS[self.level][0]}]", self.next_level),
+                   f"[d{LEVELS[self.level][0]} | {MCTS_ITERS[self.level]} it]", self.next_level),
         ]
         self.new_game()
 
@@ -129,7 +132,12 @@ class App:
     def _make_controllers(self):
         depth, tl = LEVELS[self.level]
         mm = lambda: MinimaxAgent(depth, tl)
+        mc = lambda: MCTSAgent(MCTS_ITERS[self.level], time_limit=tl)
         mode = MODES[self.mode_idx]
+        if mode == "Human vs MCTS":
+            return [None, mc()]
+        if mode == "Minimax vs MCTS":
+            return [mm(), mc()]
         if mode == "Human vs AI":
             return [None, mm()]
         if mode == "AI vs Greedy (demo)":

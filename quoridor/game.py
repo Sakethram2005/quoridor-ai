@@ -36,6 +36,8 @@ Move = tuple
 # Shortest paths depend only on (walls, pawn position, player) -> memoise them.
 _PATH_CACHE: dict = {}
 _PATH_CACHE_LIMIT = 300_000
+_FIELD_CACHE: dict = {}          # (walls, player) -> {cell: distance to goal row}
+_FIELD_CACHE_LIMIT = 100_000
 
 
 def wall_edges(r: int, c: int, o: str):
@@ -99,6 +101,32 @@ class State:
     def dist(self, player: int) -> Optional[int]:
         path = self.shortest_path(player)
         return None if path is None else len(path) - 1
+
+    def dist_field(self, player: int) -> dict:
+        """{cell: distance to `player`'s goal row} for the current walls."""
+        key = (self.walls, player)
+        try:
+            return _FIELD_CACHE[key]
+        except KeyError:
+            pass
+        if len(_FIELD_CACHE) > _FIELD_CACHE_LIMIT:
+            _FIELD_CACHE.clear()
+        field = pathfinding.distance_field(self, GOAL_ROW[player], N)
+        _FIELD_CACHE[key] = field
+        return field
+
+    def options(self, player: int) -> int:
+        """Number of first steps that keep `player` on a shortest route.
+
+        1 = the pawn is in a corridor (one well-placed wall costs a lot);
+        3 = lots of equivalent routes (walls are much less effective).
+        """
+        field = self.dist_field(player)
+        me = self.pawns[player]
+        d = field.get(me)
+        if d is None:
+            return 0
+        return sum(1 for nb in self.neighbors(me) if field.get(nb) == d - 1)
 
     # -------------------------------------------------------------- pawn moves
     def pawn_moves(self, player: Optional[int] = None) -> List[Cell]:
@@ -169,6 +197,10 @@ class State:
             cell = (move[1], move[2])
             if check and cell not in self.pawn_moves(p):
                 raise ValueError(f"illegal pawn move {move}")
+            old = _PATH_CACHE.get((self.walls, self.pawns[p], p))
+            if old is not None and len(old) > 1 and old[1] == cell:
+                # stepping along a shortest path: the rest of it is still shortest
+                _PATH_CACHE.setdefault((self.walls, cell, p), old[1:])
             pawns = list(self.pawns)
             pawns[p] = cell
             return State(pawns, self.walls_left, self.walls, 1 - p, self.blocked)

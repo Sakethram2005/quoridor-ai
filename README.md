@@ -1,4 +1,4 @@
-# Quoridor AI - A* path-finding + Minimax (alpha-beta) with a pygame demo
+# Quoridor AI - A* path-finding + Minimax (alpha-beta) + MCTS, with a pygame demo
 
 An agent that plays Quoridor against a human or another AI. Reach the opposite
 row first; on each turn either move your pawn or place one of your 10 walls.
@@ -14,7 +14,8 @@ quoridor_project/
 │   ├── __init__.py
 │   ├── game.py             # rules: board, pawn moves + jumps, wall legality
 │   ├── pathfinding.py      # A* (and BFS used only to verify A* in tests)
-│   ├── agent.py            # MinimaxAgent (+ Greedy and Random baselines)
+│   ├── agent.py            # MinimaxAgent (basic + improved), Greedy and Random baselines
+│   ├── mcts.py             # MCTSAgent (UCT with heuristic rollouts)
 │   └── gui.py              # pygame interface
 └── tests/
     └── test_quoridor.py    # unit tests (rules, A*, agent)
@@ -28,6 +29,8 @@ python main.py                      # Human (blue, bottom) vs Minimax AI (red, t
 python main.py --mode demo          # Minimax vs Greedy - best for the live demo
 python main.py --mode ai-ai --level 3
 python main.py --level 4            # strongest / slowest AI
+python main.py --mode human-mcts    # play against MCTS
+python main.py --mode minimax-mcts  # watch Minimax vs MCTS
 ```
 
 Controls: click a green dot to move your pawn; hover near a groove between
@@ -40,8 +43,8 @@ Tests and evaluation (no pygame needed):
 
 ```bash
 python -m unittest discover -v
-python tournament.py --games 10 --depth 3 --opponent greedy
-python tournament.py --games 10 --depth 3 --opponent minimax --opp-depth 1
+python tournament.py                                   # default round-robin
+python tournament.py --agents greedy minimax-basic:2 minimax:2 mcts:600 --games 10
 ```
 
 ## How it works
@@ -52,32 +55,45 @@ jumps when a wall or the board edge is behind the opponent. A wall is legal
 only if it is in bounds, does not overlap or cross another wall, the player has
 walls left, and **both players still have a path to their goal**.
 
-**A* (`pathfinding.py`).** Goal = any cell of the target row, heuristic = rows
-remaining (admissible and consistent), so paths are optimal. It is used for
-(1) the shortest-path length of each pawn, (2) the "wall must not seal a
-player in" rule, (3) the Minimax evaluation, (4) the Greedy baseline and the
-path overlay in the GUI. Results are memoised on (walls, pawn cell, player).
+**A\* (`pathfinding.py`).** Goal = any cell of the target row, heuristic = rows
+remaining (admissible and consistent), so paths are optimal. It gives (1) the
+shortest-path length of each pawn, (2) the "wall must not seal a player in"
+rule, (3) the evaluation, (4) the Greedy baseline, the MCTS playouts and the GUI
+path overlay. Results are memoised on (walls, pawn cell, player), and stepping
+along a path re-uses the rest of that path. A reverse BFS (`distance_field`)
+gives the distance of every cell at once; it is used for the flexibility feature
+and for cheap move ordering.
 
-**Minimax (`agent.py`).**
-* Minimax with alpha-beta pruning and iterative deepening under a per-move
-  time limit (levels 1-4 = depth 1-4).
-* Evaluation from the searching player's view:
-  `10 * (opp_distance - my_distance) + 1.5 * (my_walls - opp_walls)`;
-  terminal win/loss = ±10000 (+ remaining depth so faster wins are preferred).
-* Branching control: only *useful* walls are generated, i.e. walls crossing the
-  opponent's current A* path that really lengthen it. Pawn moves are always
-  generated. Children are ordered by static evaluation so alpha-beta prunes
-  more.
+**Minimax (`agent.py`)** - alpha-beta + iterative deepening under a time limit
+(levels 1-4 = depth 1-4). It exists in two configurations on the same search
+code, so the improvements can be measured:
 
-**Possible extensions** (good for the report's future-work section): a
-transposition table, wall candidates around the AI's own path to defend,
-a smarter evaluation (e.g. mobility / pawn-adjacent walls), or comparing with
-MCTS.
+| | basic (`improved=False`) | improved (default) |
+|---|---|---|
+| Evaluation | `10*(opp_dist - my_dist) + 1.5*(my_walls - opp_walls)` | path difference + tempo (side to move = half a step) + wall difference + **flexibility** (number of optimal first steps: a pawn in a corridor is easy to block) + **race rule** (a player with no walls left cannot be stopped, so whoever arrives first has won) |
+| Walls searched | every wall on the opponent's path that lengthens it | same, ranked by net gain (opponent lengthened minus self lengthened), best 10 kept |
+| Move ordering | static evaluation | transposition-table move first, then static evaluation |
+| Transposition table | no | yes (exact / lower / upper bounds, kept between moves) |
+| Root ties | first best move | random among equal moves (games are not all identical) |
 
-## Suggested report experiments
+**MCTS (`mcts.py`)** - UCT with informed playouts, because random playouts never
+finish a Quoridor game. Selection: UCT. Expansion: progressive widening
+(~1.5*sqrt(visits) children) over best-first ordered moves; walls are checked
+lazily and discarded if illegal or if they do not lengthen the opponent's path.
+Simulation: each side follows its A* path, with a 25 % chance of placing a wall
+on the opponent's path; after 30 plies the playout is cut off and scored with a
+logistic function of the path-length difference. The most-visited root child is
+played.
 
-| Experiment | Command |
-|---|---|
-| Minimax vs Random / Greedy | `python tournament.py --opponent random` |
-| Effect of depth | `python tournament.py --depth 3 --opponent minimax --opp-depth 1` |
-| Effect of wall pruning | set `useful_only=False` in `MinimaxAgent` and compare time/nodes |
+## Tournament
+
+`tournament.py` plays a round-robin. Agent specs: `random`, `greedy`,
+`minimax-basic:<depth>`, `minimax:<depth>`, `mcts:<iterations>`. Games come in
+colour-swapped pairs that start from the same random opening (`--openings`
+random pawn plies), because the player who moves first wins about 80 % of mirror
+matches. Strength is controlled by depth / iterations rather than wall-clock
+time, so results are reproducible; time per move is reported separately.
+Results are written to `tournament_results.md`.
+
+Possible extensions: wall candidates that also stop the opponent from blocking
+you, a learned evaluation, opening book, parallel MCTS (root parallelisation).

@@ -1,7 +1,15 @@
+# virtual environment
 .venv/
+
+# Python cache
 __pycache__/
 *.pyc
-games/
+
+# editor / OS files
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
+
+# saved games (only needed if you add that feature)
+games/

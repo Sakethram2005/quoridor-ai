@@ -68,3 +68,23 @@ def bfs_distance(state, start: Cell, goal_row: int) -> Optional[int]:
                 seen.add(nb)
                 queue.append((nb, d + 1))
     return None
+
+
+def distance_field(state, goal_row: int, width: int = 9):
+    """Distance-to-goal for every reachable cell (reverse BFS from the goal row).
+
+    One BFS gives the exact distance of *all* cells, which is cheaper than one
+    A* run per cell.  Used for evaluation features (how many optimal first
+    steps a pawn has) and for cheap move ordering.  Edges are symmetric, so
+    searching backwards over `neighbors` is valid.
+    """
+    dist = {(goal_row, c): 0 for c in range(width)}
+    queue = deque(dist)
+    while queue:
+        cur = queue.popleft()
+        d = dist[cur] + 1
+        for nb in state.neighbors(cur):
+            if nb not in dist:
+                dist[nb] = d
+                queue.append(nb)
+    return dist
