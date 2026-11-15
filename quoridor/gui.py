@@ -4,7 +4,9 @@ Controls
 --------
 Mouse  : click a highlighted cell to move; hover near a groove between cells to
          preview a wall (green = legal, red = illegal) and click to place it.
-N      : new game          M : cycle mode        L : cycle AI level
+Dropdowns (Blue / Red): pick Human or any AI (Minimax / MCTS level 1-4,
+         Greedy, Random) for each side independently; changing one restarts the game.
+N      : new game          S : swap sides
 P      : show/hide A* shortest paths             ESC : quit
 
 The AI thinks in a background thread so the window never freezes.
@@ -20,9 +22,8 @@ import traceback
 
 import pygame
 
-from .agent import GreedyAgent, LEVELS, MinimaxAgent
-from .game import GOAL_ROW, N, State, cell_name, describe_move
-from .mcts import MCTSAgent
+from .game import GOAL_ROW, N, State, describe_move
+from .players import PLAYER_KEYS, PLAYER_LABELS, make_agent, preset_players
 
 # ---------------------------------------------------------------- layout
 CELL, GAP = 60, 14
@@ -47,9 +48,7 @@ GOOD = (96, 212, 132)
 BAD = (236, 84, 84)
 BTN, BTN_HOVER = (52, 58, 78), (72, 80, 108)
 
-MODES = ["Human vs AI", "AI vs Greedy (demo)", "AI vs AI", "Human vs Human",
-         "Human vs MCTS", "Minimax vs MCTS"]
-MCTS_ITERS = {1: 150, 2: 400, 3: 1000, 4: 2500}      # AI level -> MCTS iterations per move
+DD_ITEM_H = 26
 PLAYER_NAMES = ("Blue (bottom)", "Red (top)")
 
 
@@ -99,8 +98,61 @@ class Button:
         surf.blit(txt, txt.get_rect(center=self.rect.center))
 
 
+class Dropdown:
+    """Simple dropdown: click the header to open, click an item to choose."""
+
+    def __init__(self, rect, keys, labels, value, on_change):
+        self.rect = pygame.Rect(rect)
+        self.keys, self.labels, self.value, self.on_change = keys, labels, value, on_change
+        self.open = False
+
+    def item_rect(self, i):
+        return pygame.Rect(self.rect.x, self.rect.bottom + 2 + i * DD_ITEM_H, self.rect.w, DD_ITEM_H)
+
+    def list_rect(self):
+        return pygame.Rect(self.rect.x, self.rect.bottom + 2, self.rect.w, DD_ITEM_H * len(self.keys))
+
+    def handle_click(self, pos):
+        """Returns True if the click was consumed."""
+        if self.open:
+            for i, k in enumerate(self.keys):
+                if self.item_rect(i).collidepoint(pos):
+                    self.open = False
+                    if k != self.value:
+                        self.value = k
+                        self.on_change()
+                    return True
+            self.open = False
+            return self.rect.collidepoint(pos)       # clicking the header again just closes
+        if self.rect.collidepoint(pos):
+            self.open = True
+            return True
+        return False
+
+    def draw_header(self, surf, font, mouse):
+        col = BTN_HOVER if self.rect.collidepoint(mouse) or self.open else BTN
+        pygame.draw.rect(surf, col, self.rect, border_radius=6)
+        txt = font.render(self.labels[self.value], True, TEXT)
+        surf.blit(txt, (self.rect.x + 10, self.rect.centery - txt.get_height() // 2))
+        cx, cy = self.rect.right - 14, self.rect.centery
+        tri = [(cx - 5, cy - 3), (cx + 5, cy - 3), (cx, cy + 4)]
+        pygame.draw.polygon(surf, MUTED, tri)
+
+    def draw_list(self, surf, font, mouse):
+        if not self.open:
+            return
+        pygame.draw.rect(surf, (30, 33, 44), self.list_rect().inflate(4, 4), border_radius=6)
+        for i, k in enumerate(self.keys):
+            r = self.item_rect(i)
+            if r.collidepoint(mouse):
+                pygame.draw.rect(surf, BTN_HOVER, r, border_radius=4)
+            colr = GOOD if k == self.value else TEXT
+            txt = font.render(self.labels[k], True, colr)
+            surf.blit(txt, (r.x + 10, r.centery - txt.get_height() // 2))
+
+
 class App:
-    def __init__(self, mode=0, level=2):
+    def __init__(self, mode="human-ai", level=2, blue=None, red=None):
         pygame.init()
         pygame.display.set_caption("Quoridor - A* + Minimax")
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -109,15 +161,19 @@ class App:
         self.f_big = pygame.font.SysFont("segoeui,helvetica,arial", 22, bold=True)
         self.f = pygame.font.SysFont("segoeui,helvetica,arial", 18)
         self.f_small = pygame.font.SysFont("segoeui,helvetica,arial", 15)
-        self.mode_idx, self.level = mode, level
         self.show_path = False
+        d_blue, d_red = preset_players(mode, level)
+        blue, red = blue or d_blue, red or d_red
+        # one dropdown per side; y matches the player blocks drawn in draw_panel
+        self.dropdowns = [
+            Dropdown((PANEL_X + 28, OY + 78 + 24, 250, 26), PLAYER_KEYS, PLAYER_LABELS, blue, self.new_game),
+            Dropdown((PANEL_X + 28, OY + 78 + 104 + 24, 250, 26), PLAYER_KEYS, PLAYER_LABELS, red, self.new_game),
+        ]
         by = 560
         self.buttons = [
             Button((PANEL_X, by, 134, 38), lambda: "New game (N)", self.new_game),
             Button((PANEL_X + 144, by, 134, 38), lambda: "A* path (P)", self.toggle_path),
-            Button((PANEL_X, by + 48, 278, 38), lambda: f"Mode (M): {MODES[self.mode_idx]}", self.next_mode),
-            Button((PANEL_X, by + 96, 278, 38), lambda: f"AI level (L): {self.level}  "
-                   f"[d{LEVELS[self.level][0]} | {MCTS_ITERS[self.level]} it]", self.next_level),
+            Button((PANEL_X, by + 48, 278, 38), lambda: "Swap sides (S)", self.swap_sides),
         ]
         self.new_game()
 
@@ -130,28 +186,12 @@ class App:
         self.controllers = self._make_controllers()
 
     def _make_controllers(self):
-        depth, tl = LEVELS[self.level]
-        mm = lambda: MinimaxAgent(depth, tl)
-        mc = lambda: MCTSAgent(MCTS_ITERS[self.level], time_limit=tl)
-        mode = MODES[self.mode_idx]
-        if mode == "Human vs MCTS":
-            return [None, mc()]
-        if mode == "Minimax vs MCTS":
-            return [mm(), mc()]
-        if mode == "Human vs AI":
-            return [None, mm()]
-        if mode == "AI vs Greedy (demo)":
-            return [mm(), GreedyAgent()]
-        if mode == "AI vs AI":
-            return [mm(), mm()]
-        return [None, None]
+        # fresh agents every game (a stale search thread can't touch the new ones)
+        return [make_agent(d.value) for d in self.dropdowns]
 
-    def next_mode(self):
-        self.mode_idx = (self.mode_idx + 1) % len(MODES)
-        self.new_game()
-
-    def next_level(self):
-        self.level = self.level % max(LEVELS) + 1
+    def swap_sides(self):
+        a, b = self.dropdowns
+        a.value, b.value = b.value, a.value
         self.new_game()
 
     def toggle_path(self):
@@ -209,6 +249,15 @@ class App:
         return None
 
     def click(self, pos):
+        was_open = any(d.open for d in self.dropdowns)
+        for d in self.dropdowns:                          # an open list sits on top
+            if d.open and d.handle_click(pos):
+                return
+        if was_open:                                      # that click only closed the list
+            return
+        for d in self.dropdowns:
+            if d.handle_click(pos):
+                return
         for b in self.buttons:
             if b.rect.collidepoint(pos):
                 b.callback()
@@ -284,16 +333,14 @@ class App:
                          (x, OY + 34))
         y = OY + 78
         for p in (0, 1):
-            ctrl = self.controllers[p]
-            who = "Human" if ctrl is None else ctrl.name
             pygame.draw.circle(self.screen, PAWN_COL[p], (x + 10, y + 12), 10)
             self.screen.blit(self.f_big.render(PLAYER_NAMES[p], True, TEXT), (x + 28, y))
-            self.screen.blit(self.f_small.render(who, True, MUTED), (x + 28, y + 26))
+            self.dropdowns[p].draw_header(self.screen, self.f_small, mouse)      # who plays this side
             d = s.dist(p)
-            self.screen.blit(self.f_small.render(f"A* distance to goal: {d}", True, TEXT), (x + 28, y + 46))
+            self.screen.blit(self.f_small.render(f"A* distance to goal: {d}", True, TEXT), (x + 28, y + 54))
             for i in range(10):                                    # walls left
                 col = WALL_COL if i < s.walls_left[p] else (60, 64, 80)
-                pygame.draw.rect(self.screen, col, (x + 28 + i * 24, y + 70, 18, 7), border_radius=3)
+                pygame.draw.rect(self.screen, col, (x + 28 + i * 24, y + 78, 18, 7), border_radius=3)
             y += 104
 
         w = s.winner()
@@ -320,6 +367,8 @@ class App:
 
         for b in self.buttons:
             b.draw(self.screen, self.f, mouse)
+        for d in self.dropdowns:                                   # open lists are drawn last (on top)
+            d.draw_list(self.screen, self.f_small, mouse)
 
     # ------------------------------------------------------------ main loop
     def run(self):
@@ -334,10 +383,8 @@ class App:
                         running = False
                     elif e.key == pygame.K_n:
                         self.new_game()
-                    elif e.key == pygame.K_m:
-                        self.next_mode()
-                    elif e.key == pygame.K_l:
-                        self.next_level()
+                    elif e.key == pygame.K_s:
+                        self.swap_sides()
                     elif e.key == pygame.K_p:
                         self.toggle_path()
                 elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
@@ -351,5 +398,5 @@ class App:
         pygame.quit()
 
 
-def run(mode=0, level=2):
-    App(mode, level).run()
+def run(mode="human-ai", level=2, blue=None, red=None):
+    App(mode, level, blue, red).run()

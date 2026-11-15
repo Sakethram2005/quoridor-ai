@@ -16,26 +16,32 @@ quoridor_project/
 │   ├── pathfinding.py      # A* (and BFS used only to verify A* in tests)
 │   ├── agent.py            # MinimaxAgent (basic + improved), Greedy and Random baselines
 │   ├── mcts.py             # MCTSAgent (UCT with heuristic rollouts)
-│   └── gui.py              # pygame interface
+│   ├── players.py          # player choices (Human / Minimax L1-4 / MCTS L1-4 / Greedy / Random)
+│   └── gui.py              # pygame interface with per-side dropdowns
 └── tests/
-    └── test_quoridor.py    # unit tests (rules, A*, agent)
+    ├── test_quoridor.py    # unit tests (rules, A*, agents)
+    └── test_players.py     # unit tests for the player options
 ```
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
-python main.py                      # Human (blue, bottom) vs Minimax AI (red, top)
+python main.py                      # then choose Blue and Red in the dropdowns
+python main.py --blue minimax4 --red minimax2   # start with Level 4 vs Level 2
 python main.py --mode demo          # Minimax vs Greedy - best for the live demo
-python main.py --mode ai-ai --level 3
-python main.py --level 4            # strongest / slowest AI
-python main.py --mode human-mcts    # play against MCTS
-python main.py --mode minimax-mcts  # watch Minimax vs MCTS
+python main.py --mode minimax-mcts --level 3    # watch Minimax vs MCTS
 ```
+
+Each side (Blue = bottom, Red = top) has its own dropdown in the side panel:
+**Human, Minimax L1-L4 (depth 1-4), MCTS L1-L4 (150 / 400 / 1000 / 2500
+iterations), Greedy A\*, Random**. Any combination works, e.g. Minimax L4 vs
+Minimax L2. Changing a dropdown restarts the game. Command-line keys for
+`--blue/--red`: `human`, `minimax1`-`minimax4`, `mcts1`-`mcts4`, `greedy`, `random`.
 
 Controls: click a green dot to move your pawn; hover near a groove between
 cells to preview a wall (green = legal, red = illegal) and click to place it.
-`N` new game · `M` change mode · `L` change AI level · `P` show A* paths · `Esc` quit.
+`N` new game · `S` swap sides · `P` show A* paths · `Esc` quit.
 Turning on the A* paths (`P`) is a good way to show the examiners what the
 algorithm "sees".
 
